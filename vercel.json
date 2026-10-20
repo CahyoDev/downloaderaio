@@ -4,7 +4,7 @@
   "installCommand": null,
   "buildCommand": null,
   "outputDirectory": "public",
-  "regions": ["sin1"],
+  "regions": ["hnd1"],
   "functions": {
     "api/http.js": { "maxDuration": 30 },
     "api/dl.js": { "maxDuration": 60 }
