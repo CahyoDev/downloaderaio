@@ -1,0 +1,11 @@
+/* Mori — Master Stylesheet */
+
+@import "./variables.css";
+@import "./base.css";
+@import "./components.css";
+@import "./home.css";
+@import "./gallery.css";
+@import "./history.css";
+@import "./settings.css";
+@import "./modals.css";
+@import "./rtl.css";

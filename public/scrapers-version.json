@@ -1,0 +1,7 @@
+{
+  "scraperVersion": 5,
+  "updatedAt": 1792322752097,
+  "minAppVersion": "4.3.0",
+  "sourceHash": "42772008c118455c11604480d7cdf6d55d328569f389f6fdfdbeb41f08d7b8b3",
+  "changelog": "Add support for TikTok tt.site shortlinks with automatic redirect resolving"
+}

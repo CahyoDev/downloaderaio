@@ -1,0 +1,15 @@
+{
+  "name": "mori-web",
+  "version": "4.5.1-web.1",
+  "private": true,
+  "type": "module",
+  "description": "Mori (Downall) versi website untuk Vercel: frontend statis + proxy serverless",
+  "license": "GPL-3.0-or-later",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "node scripts/dev-server.mjs",
+    "test": "NODE_ENV=test node --test test/*.test.mjs"
+  }
+}

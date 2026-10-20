@@ -1,0 +1,1155 @@
+import {
+  CapacitorHttp,
+  Filesystem,
+  showToast,
+  currentLang,
+} from "../utils/index.js";
+import { translations } from "../i18n/index.js";
+import { inlineProxyUrl } from "../web/webDownload.js";
+
+/**
+ * Creates a custom video player element with all MoriPlayer controls.
+ * @param {Object} dl - Download item with url, type, thumbnail properties.
+ * @param {number} index - Slide index (0-based).
+ * @param {string} resultThumbnail - Fallback thumbnail URL.
+ * @returns {HTMLElement} The player container element.
+ */
+
+export function createVideoPlayer(dl, index, resultThumbnail) {
+  const playerContainer = document.createElement("div");
+  playerContainer.className = "mori-player-container";
+  playerContainer.style.backgroundColor = "black";
+  playerContainer.style.display = "flex";
+  playerContainer.style.alignItems = "center";
+  playerContainer.style.justifyContent = "center";
+  playerContainer.style.maxHeight = "80vh";
+
+  let videoUrl = dl.url || "";
+  const isLocal =
+    dl.isLocal ||
+    videoUrl.includes("_capacitor_file_") ||
+    videoUrl.startsWith("file://") ||
+    videoUrl.startsWith("content://") ||
+    videoUrl.startsWith("asset://") ||
+    videoUrl.startsWith("tauri://") ||
+    videoUrl.includes("localhost") ||
+    videoUrl.includes("127.0.0.1");
+  const isDouyin = /douyin|snssdk/i.test(videoUrl);
+
+  if (videoUrl.startsWith("http://") && !isDouyin && !isLocal) {
+    videoUrl = videoUrl.replace("http://", "https://");
+  }
+
+  // Detect audio-only type (MP3, M4A, etc.) → use <audio> element on Desktop
+  const dlTypeLower = (dl.type || "").toLowerCase();
+  const fileNameLower = (
+    dl.filename ||
+    dl.title ||
+    videoUrl ||
+    ""
+  ).toLowerCase();
+  const isAudioOnly =
+    dlTypeLower.includes("mp3") ||
+    dlTypeLower.includes("audio") ||
+    dlTypeLower.includes("m4a") ||
+    fileNameLower.endsWith(".mp3") ||
+    fileNameLower.endsWith(".m4a") ||
+    fileNameLower.endsWith(".aac") ||
+    fileNameLower.endsWith(".opus") ||
+    fileNameLower.endsWith(".flac") ||
+    fileNameLower.endsWith(".wav");
+
+  const tauriConvertFileSrcCheck =
+    window.__TAURI__?.core?.convertFileSrc ||
+    window.__TAURI_INTERNALS__?.convertFileSrc ||
+    window.__TAURI__?.convertFileSrc;
+  const isDesktop =
+    !!tauriConvertFileSrcCheck && !window.Capacitor?.isNativePlatform?.();
+
+  if (isAudioOnly) {
+    playerContainer.classList.add("is-audio");
+    playerContainer.style.backgroundColor = "var(--surface)";
+    const audioPlaceholder = document.createElement("div");
+    audioPlaceholder.className = "mori-player-audio-placeholder";
+    audioPlaceholder.innerHTML = `
+      <div class="mori-player-audio-icon">
+        <svg viewBox="0 0 24 24" width="44" height="44" fill="currentColor">
+          <path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/>
+        </svg>
+      </div>
+    `;
+    playerContainer.appendChild(audioPlaceholder);
+  }
+
+  // Use <audio> for audio-only files on all platforms to prevent video placeholder artifacts
+  const video = isAudioOnly
+    ? (() => {
+        const audio = document.createElement("audio");
+        audio.setAttribute("referrerpolicy", "no-referrer");
+        audio.controls = false;
+        audio.style.display = "none";
+        return audio;
+      })()
+    : (() => {
+        const v = document.createElement("video");
+        v.setAttribute("referrerpolicy", "no-referrer");
+        v.poster =
+          "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg'/>";
+        return v;
+      })();
+
+  const isBilibili =
+    /bilibili|bilivideo|akamaized/i.test(videoUrl) ||
+    (dl?.headers?.Referer && dl.headers.Referer.includes("bilibili"));
+  const isRedNote = /xiaohongshu|rednote|xhscdn/i.test(videoUrl);
+  const isPixiv =
+    /pixiv|ugoira/i.test(videoUrl) ||
+    (dl.type || "").toLowerCase().includes("ugoira");
+  const needsBypass =
+    (isBilibili || isDouyin || isRedNote || isPixiv) && !isLocal;
+  const isNative = window.Capacitor?.isNativePlatform?.();
+
+  const removeFallbackImg = () => {
+    const fallbackImg = playerContainer.querySelector(".fallback-img");
+    if (fallbackImg) fallbackImg.remove();
+  };
+  const removeLoading = () => {
+    playerContainer.classList.remove("mori-loading");
+    removeFallbackImg();
+  };
+
+  const tauriInvoke =
+    window.__TAURI__?.core?.invoke ||
+    window.__TAURI_INTERNALS__?.invoke ||
+    window.__TAURI__?.invoke;
+
+  const tauriConvertFileSrc =
+    window.__TAURI__?.core?.convertFileSrc ||
+    window.__TAURI_INTERNALS__?.convertFileSrc ||
+    window.__TAURI__?.convertFileSrc;
+
+  let userPaused = false;
+  let unmuteIcon = null;
+  let muteIcon = null;
+  let isTransitioningFs = false;
+  let isDragging = false;
+  let syncVolumeUI = () => {};
+
+  const isSlideActive = () => {
+    if (video._isStopped) return false;
+    if (
+      playerContainer.closest(".gallery-viewer") ||
+      playerContainer.closest(".gallery-viewer-body")
+    ) {
+      return true;
+    }
+    const parentSlide =
+      playerContainer.closest(".preview-slide") ||
+      playerContainer.parentElement;
+    if (parentSlide && parentSlide.classList.contains("preview-slide")) {
+      return parentSlide.classList.contains("active");
+    }
+    return index === 0;
+  };
+
+  const tryAutoPlay = () => {
+    if (video._isStopped || userPaused) return;
+    const isAutoPlay = localStorage.getItem("mori_autoplay") !== "false";
+    if (isAutoPlay && isSlideActive() && video.paused) {
+      const isLoop = localStorage.getItem("mori_loop") !== "false";
+      video.loop = isLoop;
+      if (isLoop) video.setAttribute("loop", "");
+      else video.removeAttribute("loop");
+      const playPromise = video.play();
+      if (playPromise !== undefined) {
+        playPromise.catch((err) => {
+          if (
+            err &&
+            (err.name === "NotAllowedError" || err.name === "AbortError") &&
+            !video.muted
+          ) {
+            console.warn(
+              "Unmuted autoplay restricted, attempting muted autoplay:",
+              err,
+            );
+            video.muted = true;
+            syncVolumeUI();
+            video
+              .play()
+              .then(() => syncVolumeUI())
+              .catch(() => {});
+          }
+        });
+      }
+    }
+  };
+
+  playerContainer._tryAutoPlay = () => {
+    userPaused = false;
+    tryAutoPlay();
+  };
+
+  if (isLocal && (isNative || tauriConvertFileSrc || tauriInvoke)) {
+    playerContainer.classList.add("mori-loading");
+    let cleanPath = dl.rawUri || videoUrl || dl.rawPath || "";
+
+    if (cleanPath.startsWith("content://")) {
+      const capSrc = window.Capacitor?.convertFileSrc
+        ? window.Capacitor.convertFileSrc(cleanPath)
+        : cleanPath;
+      console.log("Loading content:// URI:", capSrc);
+      video.src = capSrc;
+      removeLoading();
+      tryAutoPlay();
+    } else {
+      if (cleanPath.includes("_capacitor_file_")) {
+        cleanPath = cleanPath.substring(
+          cleanPath.indexOf("_capacitor_file_") + 16,
+        );
+      }
+      if (cleanPath.startsWith("file://")) {
+        cleanPath = cleanPath.replace(/^file:\/\//, "");
+      }
+      try {
+        cleanPath = decodeURIComponent(cleanPath);
+      } catch (_) {}
+
+      if (tauriInvoke) {
+        const mimeType = isAudioOnly
+          ? fileNameLower.endsWith(".m4a")
+            ? "audio/mp4"
+            : "audio/mpeg"
+          : "video/mp4";
+        tauriInvoke("tauri_read_file_bytes", { path: cleanPath })
+          .then((bytes) => {
+            if (video._isStopped) return;
+            if (bytes && bytes.length > 0) {
+              const blob = new Blob([new Uint8Array(bytes)], {
+                type: mimeType,
+              });
+              const blobUrl = URL.createObjectURL(blob);
+              playerContainer._blobUrl = blobUrl;
+              video.src = blobUrl;
+              video.load();
+              removeLoading();
+              tryAutoPlay();
+            } else {
+              // fallback to convertFileSrc
+              if (tauriConvertFileSrc) {
+                video.src = tauriConvertFileSrc(cleanPath);
+                removeLoading();
+                tryAutoPlay();
+              }
+            }
+          })
+          .catch(() => {
+            if (video._isStopped) return;
+            // fallback to convertFileSrc
+            if (tauriConvertFileSrc) {
+              video.src = tauriConvertFileSrc(cleanPath);
+              removeLoading();
+              tryAutoPlay();
+            }
+          });
+      } else if (tauriConvertFileSrc) {
+        video.src = tauriConvertFileSrc(cleanPath);
+        removeLoading();
+        tryAutoPlay();
+      } else if (isNative) {
+        let rawFileUrl;
+        if (cleanPath.startsWith("/")) {
+          rawFileUrl = "file://" + cleanPath;
+        } else {
+          const platform = window.Capacitor?.getPlatform?.();
+          if (platform === "android") {
+            rawFileUrl =
+              "file:///storage/emulated/0/" + cleanPath.replace(/^\//, "");
+          } else {
+            rawFileUrl = dl.rawUri || "file:///" + cleanPath.replace(/^\//, "");
+          }
+        }
+        const capSrc = window.Capacitor.convertFileSrc(rawFileUrl);
+
+        video.src = capSrc;
+        removeLoading();
+        tryAutoPlay();
+      } else {
+        video.src = "file://" + cleanPath;
+        tryAutoPlay();
+      }
+    }
+  }
+
+  if (needsBypass) {
+    playerContainer.classList.add("mori-loading");
+
+    let referer = "https://www.google.com/";
+    let ua =
+      "Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1";
+
+    if (isBilibili) {
+      referer = videoUrl.includes("bilibili.tv")
+        ? "https://www.bilibili.tv/"
+        : "https://www.bilibili.com/";
+      ua =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36";
+    } else if (isDouyin) {
+      referer = "https://www.douyin.com/";
+    } else if (isRedNote) {
+      referer = "https://www.xiaohongshu.com/";
+    } else if (isPixiv) {
+      referer = "https://www.pixiv.net/";
+      ua =
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+    }
+
+    if (isNative && CapacitorHttp) {
+      CapacitorHttp.get({
+        url: videoUrl,
+        responseType: "blob",
+        headers: {
+          Referer: referer,
+          "User-Agent": ua,
+          Range: "bytes=0-3145728",
+        },
+      })
+        .then((res) => {
+          if (
+            res.status >= 200 &&
+            res.status < 300 &&
+            res.data &&
+            (res.data instanceof Blob || res.data.constructor?.name === "Blob")
+          ) {
+            const fileUrl = URL.createObjectURL(res.data);
+            playerContainer._blobUrl = fileUrl;
+            video.src = fileUrl;
+            removeLoading();
+            tryAutoPlay();
+          } else {
+            throw new Error(`Invalid response (Status ${res.status})`);
+          }
+        })
+        .catch((err) => {
+          console.error("Native preview fetch failed, falling back:", err);
+          video.src = videoUrl;
+          removeLoading();
+          tryAutoPlay();
+        });
+    } else if (tauriInvoke) {
+      tauriInvoke("tauri_fetch_bytes", {
+        url: videoUrl,
+        headers: { Referer: referer, "User-Agent": ua },
+      })
+        .then((bytes) => {
+          if (bytes && bytes.length > 0) {
+            const blob = new Blob([new Uint8Array(bytes)], {
+              type: "video/mp4",
+            });
+            const blobUrl = URL.createObjectURL(blob);
+            playerContainer._blobUrl = blobUrl;
+            video.src = blobUrl;
+            removeLoading();
+            tryAutoPlay();
+          } else {
+            video.src = videoUrl;
+            removeLoading();
+            tryAutoPlay();
+          }
+        })
+        .catch((err) => {
+          console.error("Desktop preview fetch failed, falling back:", err);
+          video.src = videoUrl;
+          removeLoading();
+          tryAutoPlay();
+        });
+    } else {
+      video.src = videoUrl;
+      tryAutoPlay();
+    }
+  } else if (!isLocal) {
+    video.src = videoUrl;
+  }
+
+  const loopSetting = localStorage.getItem("mori_loop") !== "false";
+  video.loop = loopSetting;
+  if (loopSetting) {
+    video.setAttribute("loop", "");
+  } else {
+    video.removeAttribute("loop");
+  }
+  video.preload = index === 0 ? "auto" : "metadata";
+  const autoPlaySetting = localStorage.getItem("mori_autoplay") !== "false";
+  video.autoplay = false;
+  video.playsInline = true;
+  video.setAttribute("playsinline", "true");
+  video.setAttribute("webkit-playsinline", "true");
+
+  let posterThumb = dl.thumbnail || resultThumbnail || "";
+  const isIndownPoster =
+    posterThumb.includes("indown.io") &&
+    !posterThumb.includes("url=") &&
+    !posterThumb.includes("token=");
+
+  const isLocalPoster =
+    posterThumb.startsWith("data:") ||
+    posterThumb.startsWith("blob:") ||
+    posterThumb.includes("_capacitor_file_") ||
+    posterThumb.startsWith("file://");
+
+  if (
+    posterThumb &&
+    (posterThumb.includes("logo") ||
+      posterThumb.includes("placeholder") ||
+      posterThumb.includes("images/") ||
+      isIndownPoster ||
+      (!navigator.onLine && !isLocalPoster) ||
+      (isLocal && !isLocalPoster))
+  ) {
+    posterThumb = "";
+  }
+  if (posterThumb && window.__MORI_WEB__ && /^https?:\/\//i.test(posterThumb)) {
+    // Web: coba langsung dulu; bila CDN menolak hotlink, ulangi lewat proxy sendiri
+    const probe = new Image();
+    probe.referrerPolicy = "no-referrer";
+    probe.onload = () => {
+      video.poster = posterThumb;
+    };
+    probe.onerror = () => {
+      video.poster = inlineProxyUrl(posterThumb);
+    };
+    probe.src = posterThumb;
+  } else if (posterThumb) {
+    video.poster = posterThumb;
+  }
+
+  playerContainer.classList.add("mori-loading");
+
+  video.onwaiting = () => {
+    if (isTransitioningFs || isDragging) return;
+    playerContainer.classList.add("mori-loading");
+  };
+  video.onseeked = removeLoading;
+  video.onplaying = removeLoading;
+  video.oncanplay = () => {
+    removeLoading();
+    tryAutoPlay();
+  };
+  video.onloadeddata = () => {
+    removeLoading();
+    tryAutoPlay();
+  };
+  video.onloadedmetadata = () => {
+    removeLoading();
+    updateProgress();
+    playerContainer.style.aspectRatio = "auto";
+  };
+  video.onstalled = removeLoading;
+  video.onpause = removeLoading;
+
+  let isRetryingLocal = false;
+  let isRetryingRemote = false;
+
+  video.onerror = async (e) => {
+    console.error("Video element loading error:", video.error, video.src);
+    if (
+      !isRetryingLocal &&
+      (videoUrl.includes("_capacitor_file_") ||
+        videoUrl.startsWith("file://") ||
+        isLocal)
+    ) {
+      isRetryingLocal = true;
+      console.warn("Attempting local blob fallback for video...");
+      try {
+        let cleanPath = dl.rawUri || dl.rawPath || videoUrl;
+        if (cleanPath.includes("_capacitor_file_")) {
+          cleanPath = cleanPath.substring(
+            cleanPath.indexOf("_capacitor_file_") + 16,
+          );
+        }
+        if (cleanPath.startsWith("file://")) {
+          cleanPath = cleanPath.replace(/^file:\/\//, "");
+        }
+        try {
+          cleanPath = decodeURIComponent(cleanPath);
+        } catch (_) {}
+
+        const mimeType = isAudioOnly
+          ? fileNameLower.endsWith(".m4a")
+            ? "audio/mp4"
+            : "audio/mpeg"
+          : "video/mp4";
+
+        if (tauriInvoke) {
+          try {
+            const bytes = await tauriInvoke("tauri_read_file_bytes", {
+              path: cleanPath,
+            });
+            if (bytes && bytes.length > 0) {
+              const blob = new Blob([new Uint8Array(bytes)], {
+                type: mimeType,
+              });
+              const blobUrl = URL.createObjectURL(blob);
+              playerContainer._blobUrl = blobUrl;
+              video.src = blobUrl;
+              video.load();
+              removeLoading();
+              return;
+            }
+          } catch (tErr) {
+            console.warn("Tauri read file fallback error:", tErr);
+          }
+        }
+
+        if (Filesystem) {
+          const rawTarget = dl.rawPath || cleanPath;
+          let relPath = rawTarget
+            .replace(/^.*\/storage\/emulated\/0\//, "")
+            .replace(/^\//, "");
+          try {
+            relPath = decodeURIComponent(relPath);
+          } catch (_) {}
+
+          let res;
+          const dirsToTry = ["EXTERNAL_STORAGE", "DOCUMENTS", "EXTERNAL"];
+          for (const d of dirsToTry) {
+            try {
+              res = await Filesystem.readFile({
+                path: relPath,
+                directory: d,
+              });
+              if (res?.data) break;
+            } catch (_) {}
+          }
+
+          if (!res?.data && dl.rawPath) {
+            let directRaw = dl.rawPath;
+            try {
+              directRaw = decodeURIComponent(directRaw);
+            } catch (_) {}
+            for (const d of dirsToTry) {
+              try {
+                res = await Filesystem.readFile({
+                  path: directRaw,
+                  directory: d,
+                });
+                if (res?.data) break;
+              } catch (_) {}
+            }
+          }
+
+          if (!res?.data) {
+            try {
+              res = await Filesystem.readFile({ path: cleanPath });
+            } catch (_) {}
+          }
+
+          if (res && res.data) {
+            const byteChars = atob(res.data);
+            const byteArr = new Uint8Array(byteChars.length);
+            for (let i = 0; i < byteChars.length; i++) {
+              byteArr[i] = byteChars.charCodeAt(i);
+            }
+            const blob = new Blob([byteArr], { type: mimeType });
+            const blobUrl = URL.createObjectURL(blob);
+            playerContainer._blobUrl = blobUrl;
+            video.src = blobUrl;
+            video.load();
+            removeLoading();
+            return;
+          }
+        }
+      } catch (fbErr) {
+        console.warn("Blob fallback failed:", fbErr);
+      }
+    }
+
+    // Web: CDN sering menolak hotlink tanpa Referer -> coba sekali lewat proxy sendiri
+    if (
+      window.__MORI_WEB__ &&
+      !isLocal &&
+      !video.dataset.webProxied &&
+      /^https?:\/\//i.test(dl.remoteUrl || videoUrl || "")
+    ) {
+      video.dataset.webProxied = "1";
+      video.src = inlineProxyUrl(dl.remoteUrl || videoUrl);
+      video.load();
+      return;
+    }
+
+    if (
+      !isLocal &&
+      !isRetryingRemote &&
+      dl.remoteUrl &&
+      video.src !== dl.remoteUrl &&
+      navigator.onLine
+    ) {
+      isRetryingRemote = true;
+      console.warn("Falling back to remote stream URL:", dl.remoteUrl);
+      video.src = dl.remoteUrl;
+      video.load();
+      return;
+    }
+
+    removeLoading();
+    if (bigPlay && bigPlay.parentNode) bigPlay.remove();
+    const ctrlEl = playerContainer.querySelector(".mori-player-controls");
+    if (ctrlEl) ctrlEl.remove();
+
+    playerContainer.dispatchEvent(
+      new CustomEvent("mori_media_load_error", { bubbles: true }),
+    );
+
+    if (
+      !playerContainer.querySelector(".mori-player-error") &&
+      !playerContainer.querySelector(".fallback-img")
+    ) {
+      const fallbackSrc = posterThumb || dl.thumbnail || resultThumbnail || "";
+      if (fallbackSrc) {
+        const fbImg = document.createElement("img");
+        fbImg.className = "fallback-img";
+        fbImg.src = fallbackSrc;
+        fbImg.style.width = "100%";
+        fbImg.style.maxHeight = "100%";
+        fbImg.style.objectFit = "contain";
+        fbImg.style.borderRadius = "8px";
+        fbImg.setAttribute("referrerpolicy", "no-referrer");
+        if (window.__MORI_WEB__ && /^https?:\/\//i.test(fallbackSrc)) {
+          fbImg.onerror = () => {
+            if (fbImg.dataset.webProxied) return;
+            fbImg.dataset.webProxied = "1";
+            fbImg.src = inlineProxyUrl(fallbackSrc);
+          };
+        }
+
+        if (isLocal && (dl.rawPath || dl.rawUri || videoUrl)) {
+          fbImg.style.cursor = "pointer";
+          const openTarget = () => {
+            const targetPath = dl.rawPath || dl.rawUri || videoUrl;
+            if (window.MoriMainBridge?.openFile) {
+              window.MoriMainBridge.openFile(targetPath);
+            }
+          };
+          fbImg.onclick = openTarget;
+
+          const playBadge = document.createElement("div");
+          playBadge.className = "mori-player-external-play";
+          playBadge.innerHTML = `
+            <svg viewBox="0 0 24 24" width="48" height="48" fill="white" style="filter: drop-shadow(0 2px 8px rgba(0,0,0,0.6));">
+              <path d="M8 5v14l11-7z"/>
+            </svg>
+          `;
+          playBadge.style.position = "absolute";
+          playBadge.style.top = "50%";
+          playBadge.style.left = "50%";
+          playBadge.style.transform = "translate(-50%, -50%)";
+          playBadge.style.cursor = "pointer";
+          playBadge.style.zIndex = "5";
+          playBadge.style.pointerEvents = "auto";
+          playBadge.onclick = (e) => {
+            e.stopPropagation();
+            openTarget();
+          };
+          playerContainer.appendChild(playBadge);
+        }
+
+        playerContainer.appendChild(fbImg);
+      } else {
+        const errOverlay = document.createElement("div");
+        errOverlay.className = "mori-player-error";
+        errOverlay.style.position = "absolute";
+        errOverlay.style.top = "0";
+        errOverlay.style.left = "0";
+        errOverlay.style.width = "100%";
+        errOverlay.style.height = "100%";
+        errOverlay.style.backgroundColor = "rgba(0,0,0,0.9)";
+        errOverlay.style.display = "flex";
+        errOverlay.style.flexDirection = "column";
+        errOverlay.style.alignItems = "center";
+        errOverlay.style.justifyContent = "center";
+        errOverlay.style.color = "#fff";
+        errOverlay.style.zIndex = "10";
+        errOverlay.style.padding = "20px";
+        errOverlay.style.textAlign = "center";
+
+        errOverlay.innerHTML = `
+          <svg viewBox="0 0 24 24" width="40" height="40" fill="#fff" style="margin-bottom:12px">
+            <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/>
+          </svg>
+          <div style="font-weight:bold;font-size:15px;margin-bottom:8px">${translations[currentLang][videoUrl.includes("_capacitor_file_") || videoUrl.startsWith("file://") || videoUrl.startsWith("content://") ? "player-error-file" : "player-error-stream"]}</div>
+        `;
+        playerContainer.appendChild(errOverlay);
+      }
+    }
+  };
+
+  // Custom Controls
+  playerContainer.appendChild(video);
+
+  const bigPlay = document.createElement("div");
+  bigPlay.className = "mori-player-big-play visible";
+  bigPlay.style.cursor = "pointer";
+  bigPlay.innerHTML = `<svg viewBox="0 0 24 24" width="30" height="30" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>`;
+  playerContainer.appendChild(bigPlay);
+
+  const unmuteBadge = document.createElement("button");
+  unmuteBadge.className = "mori-player-unmute-badge hidden";
+  unmuteBadge.setAttribute("type", "button");
+  unmuteBadge.setAttribute("aria-label", "Unmute");
+  unmuteBadge.innerHTML = `
+    <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
+      <path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.58.45-1.24.8-1.95.99v2.06c1.26-.26 2.4-.83 3.37-1.62l3.06 3.06L21 21.73l-16.73-16.73zM12 4L9.91 6.09 12 8.18V4z"/>
+    </svg>
+    <span>Tap to unmute</span>
+  `;
+  playerContainer.appendChild(unmuteBadge);
+
+  const controls = document.createElement("div");
+  controls.className = "mori-player-controls";
+  controls.innerHTML = `
+    <div class="mori-player-bar">
+      <button class="mori-player-btn play-toggle" title="Play/Pause">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor" class="play-icon"><path d="M8 5v14l11-7z"/></svg>
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor" class="pause-icon hidden"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+      </button>
+      <span class="mori-player-cur">0:00</span>
+      <div class="mori-player-progress">
+        <div class="mori-player-progress-inner"></div>
+      </div>
+      <span class="mori-player-dur">0:00</span>
+      <button class="mori-player-btn volume-toggle" title="Mute/Unmute">
+        <svg class="unmute-icon" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/></svg>
+        <svg class="mute-icon hidden" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.58.45-1.24.8-1.95.99v2.06c1.26-.26 2.4-.83 3.37-1.62l3.06 3.06L21 21.73l-16.73-16.73zM12 4L9.91 6.09 12 8.18V4z"/></svg>
+      </button>
+      <button class="mori-player-btn fs-toggle" title="Fullscreen">
+        <svg class="fs-enter-icon" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z"/></svg>
+        <svg class="fs-exit-icon hidden" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M5 16h3v3h2v-5H5v2zm3-8H5v2h5V5H8v3zm6 11h2v-3h3v-2h-5v5zm2-11V5h-2v5h5V8h-3z"/></svg>
+      </button>
+    </div>
+  `;
+  playerContainer.appendChild(controls);
+
+  // Fullscreen top header: Title on the left, Close button on the right
+  const fsTop = document.createElement("div");
+  fsTop.className = "mori-player-fs-top";
+
+  const fsTitle = document.createElement("div");
+  fsTitle.className = "mori-player-fs-title";
+  fsTitle.textContent = dl.title || dl.filename || "";
+
+  const fsCloseBtn = document.createElement("button");
+  fsCloseBtn.className = "mori-player-fs-close";
+  fsCloseBtn.title = "Close";
+  fsCloseBtn.setAttribute("aria-label", "Close fullscreen");
+  fsCloseBtn.innerHTML = `<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>`;
+
+  fsTop.appendChild(fsTitle);
+  fsTop.appendChild(fsCloseBtn);
+  playerContainer.appendChild(fsTop);
+
+  // JS Logic for this player
+  const playBtn = controls.querySelector(".play-toggle");
+  const playIcon = playBtn.querySelector(".play-icon");
+  const pauseIcon = playBtn.querySelector(".pause-icon");
+  const curDisplay = controls.querySelector(".mori-player-cur");
+  const durDisplay = controls.querySelector(".mori-player-dur");
+  const prog = controls.querySelector(".mori-player-progress");
+  const progInner = controls.querySelector(".mori-player-progress-inner");
+
+  const volumeBtn = controls.querySelector(".volume-toggle");
+  unmuteIcon = volumeBtn?.querySelector(".unmute-icon");
+  muteIcon = volumeBtn?.querySelector(".mute-icon");
+
+  const fsBtn = controls.querySelector(".fs-toggle");
+  const fsEnterIcon = fsBtn?.querySelector(".fs-enter-icon");
+  const fsExitIcon = fsBtn?.querySelector(".fs-exit-icon");
+
+  syncVolumeUI = () => {
+    const isMuted = video.muted || video.volume === 0;
+    if (isMuted) {
+      unmuteIcon?.classList.add("hidden");
+      muteIcon?.classList.remove("hidden");
+      if (volumeBtn) volumeBtn.title = "Unmute";
+      if (!video.paused && !video.ended) {
+        unmuteBadge.classList.remove("hidden");
+      } else {
+        unmuteBadge.classList.add("hidden");
+      }
+    } else {
+      unmuteIcon?.classList.remove("hidden");
+      muteIcon?.classList.add("hidden");
+      if (volumeBtn) volumeBtn.title = "Mute";
+      unmuteBadge.classList.add("hidden");
+    }
+  };
+
+  const updateFsIcons = () => {
+    if (playerContainer.classList.contains("mori-fullscreen")) {
+      fsEnterIcon?.classList.add("hidden");
+      fsExitIcon?.classList.remove("hidden");
+      if (fsBtn) fsBtn.title = "Exit Fullscreen";
+    } else {
+      fsEnterIcon?.classList.remove("hidden");
+      fsExitIcon?.classList.add("hidden");
+      if (fsBtn) fsBtn.title = "Fullscreen";
+    }
+  };
+
+  unmuteBadge.onclick = (e) => {
+    e.stopPropagation();
+    video.muted = false;
+    if (video.volume === 0) video.volume = 1;
+    syncVolumeUI();
+  };
+
+  volumeBtn.onclick = (e) => {
+    e.stopPropagation();
+    if (video.muted || video.volume === 0) {
+      video.muted = false;
+      if (video.volume === 0) video.volume = 1;
+    } else {
+      video.muted = true;
+    }
+    syncVolumeUI();
+  };
+
+  const handleKeydown = (e) => {
+    if (!playerContainer.classList.contains("mori-fullscreen")) return;
+    if (e.key === "Escape") {
+      exitCustomFullscreen();
+    }
+  };
+  window.addEventListener("keydown", handleKeydown);
+
+  fsBtn.onclick = (e) => {
+    e.stopPropagation();
+    if (playerContainer.classList.contains("mori-fullscreen")) {
+      exitCustomFullscreen();
+    } else {
+      enterCustomFullscreen();
+    }
+  };
+
+  const StatusBar = window.Capacitor?.Plugins?.StatusBar;
+  let fsPlaceholder = null;
+
+  const enterCustomFullscreen = () => {
+    if (playerContainer.classList.contains("mori-fullscreen")) return;
+
+    isTransitioningFs = true;
+    setTimeout(() => {
+      isTransitioningFs = false;
+    }, 400);
+
+    fsPlaceholder = document.createElement("div");
+    fsPlaceholder.className = "mori-player-fs-placeholder";
+    fsPlaceholder.style.display = "none";
+    if (playerContainer.parentNode) {
+      playerContainer.parentNode.insertBefore(fsPlaceholder, playerContainer);
+    }
+
+    const wasPaused = video.paused;
+    const curTime = video.currentTime;
+
+    document.body.appendChild(playerContainer);
+    playerContainer.classList.add("mori-fullscreen");
+    updateFsIcons();
+    syncVolumeUI();
+    document.body.classList.add("mori-has-fullscreen");
+
+    StatusBar?.hide?.().catch?.(() => {});
+
+    if (!isNaN(curTime) && curTime > 0 && Math.abs(video.currentTime - curTime) > 0.5) {
+      try {
+        video.currentTime = curTime;
+      } catch (_) {}
+    }
+    if (!wasPaused && video.paused) {
+      video.play().catch(() => {});
+    }
+
+    playerContainer.classList.add("touching");
+    clearTimeout(hideTimeout);
+    hideTimeout = setTimeout(
+      () => playerContainer.classList.remove("touching"),
+      2500,
+    );
+  };
+
+  const exitCustomFullscreen = () => {
+    if (!playerContainer.classList.contains("mori-fullscreen")) return;
+
+    isTransitioningFs = true;
+    setTimeout(() => {
+      isTransitioningFs = false;
+    }, 400);
+
+    playerContainer.classList.remove("mori-fullscreen");
+    updateFsIcons();
+    syncVolumeUI();
+    document.body.classList.remove("mori-has-fullscreen");
+
+    StatusBar?.show?.().catch?.(() => {});
+
+    const wasPaused = video.paused;
+    const curTime = video.currentTime;
+
+    if (fsPlaceholder && fsPlaceholder.parentNode) {
+      fsPlaceholder.parentNode.insertBefore(playerContainer, fsPlaceholder);
+      fsPlaceholder.remove();
+      fsPlaceholder = null;
+    }
+
+    if (!isNaN(curTime) && curTime > 0 && Math.abs(video.currentTime - curTime) > 0.5) {
+      try {
+        video.currentTime = curTime;
+      } catch (_) {}
+    }
+    if (!wasPaused && video.paused) {
+      video.play().catch(() => {});
+    }
+  };
+
+  video.addEventListener("volumechange", syncVolumeUI);
+  syncVolumeUI();
+  updateFsIcons();
+
+  playerContainer._exitFullscreen = exitCustomFullscreen;
+
+  fsCloseBtn.onclick = (e) => {
+    e.stopPropagation();
+    exitCustomFullscreen();
+  };
+
+  const formatTime = (s) => {
+    if (!s || isNaN(s)) return "0:00";
+    const min = Math.floor(s / 60);
+    const sec = Math.floor(s % 60);
+    return `${min}:${sec < 10 ? "0" : ""}${sec}`;
+  };
+
+  let lastShowTime = 0;
+  const updateProgress = () => {
+    if (isDragging) return;
+    const p = (video.currentTime / (video.duration || 1)) * 100;
+    progInner.style.width = `${p}%`;
+    if (curDisplay) curDisplay.textContent = formatTime(video.currentTime);
+    if (durDisplay) durDisplay.textContent = formatTime(video.duration);
+  };
+
+  video.onplay = () => {
+    removeLoading();
+    playIcon.classList.add("hidden");
+    pauseIcon.classList.remove("hidden");
+    bigPlay.classList.remove("visible");
+    syncVolumeUI();
+  };
+
+  video.onpause = () => {
+    const isLoop = localStorage.getItem("mori_loop") !== "false";
+    if (video.ended && isLoop && !userPaused && !video._isStopped) {
+      return;
+    }
+    playIcon.classList.remove("hidden");
+    pauseIcon.classList.add("hidden");
+    bigPlay.innerHTML = `<svg viewBox="0 0 24 24" width="30" height="30" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>`;
+    bigPlay.classList.add("visible");
+    unmuteBadge.classList.add("hidden");
+  };
+
+  const togglePlay = (e) => {
+    if (e) e.stopPropagation();
+    if (video.paused) {
+      userPaused = false;
+      const isLoop = localStorage.getItem("mori_loop") !== "false";
+      video.loop = isLoop;
+      if (isLoop) video.setAttribute("loop", "");
+      else video.removeAttribute("loop");
+      video.play().catch((err) => {
+        console.warn("video.play() failed:", err);
+      });
+    } else {
+      userPaused = true;
+      video.pause();
+    }
+  };
+
+  video.addEventListener("ended", () => {
+    const isLoop = localStorage.getItem("mori_loop") !== "false";
+    if (isLoop && !userPaused && !video._isStopped) {
+      video.currentTime = 0;
+      video.play().catch((err) => {
+        console.warn("video loop play failed:", err);
+      });
+    }
+  });
+
+  bigPlay.onclick = togglePlay;
+  playBtn.onclick = togglePlay;
+  video.onclick = togglePlay;
+
+  video.ontimeupdate = updateProgress;
+  video.onloadedmetadata = () => {
+    updateProgress();
+    // Remove fixed aspect ratio, let it be natural or max-height
+    playerContainer.style.aspectRatio = "auto";
+  };
+
+
+
+
+  let dragTargetTime = 0;
+  let wasPausedBeforeDrag = false;
+
+  const seekToPos = (clientX, commit = false) => {
+    const rect = prog.getBoundingClientRect();
+    if (!rect.width) return;
+    let pos = (clientX - rect.left) / rect.width;
+    pos = Math.max(0, Math.min(1, pos));
+    dragTargetTime = pos * (video.duration || 0);
+    progInner.style.width = `${pos * 100}%`;
+    if (curDisplay) curDisplay.textContent = formatTime(dragTargetTime);
+    if (commit) {
+      video.currentTime = dragTargetTime;
+    }
+  };
+
+  const startDrag = (e) => {
+    isDragging = true;
+    wasPausedBeforeDrag = video.paused;
+    const clientX = e.clientX ?? e.touches?.[0]?.clientX;
+    if (clientX !== undefined) {
+      seekToPos(clientX, false);
+    }
+  };
+
+  const doDrag = (e) => {
+    if (isDragging) {
+      const clientX = e.clientX ?? e.touches?.[0]?.clientX;
+      if (clientX !== undefined) {
+        seekToPos(clientX, false);
+      }
+    }
+  };
+
+  const stopDrag = (e) => {
+    if (!isDragging) return;
+    isDragging = false;
+    const clientX = e?.clientX ?? e?.changedTouches?.[0]?.clientX;
+    if (clientX !== undefined) {
+      seekToPos(clientX, true);
+    } else {
+      video.currentTime = dragTargetTime;
+    }
+    if (!wasPausedBeforeDrag && video.paused) {
+      video.play().catch(() => {});
+    }
+  };
+
+  prog.addEventListener("mousedown", startDrag);
+  window.addEventListener("mousemove", doDrag);
+  window.addEventListener("mouseup", stopDrag);
+
+  prog.addEventListener(
+    "touchstart",
+    (e) => {
+      e.stopPropagation();
+      startDrag(e);
+    },
+    { passive: false },
+  );
+  window.addEventListener(
+    "touchmove",
+    (e) => {
+      if (isDragging) {
+        e.preventDefault();
+        doDrag(e);
+      }
+    },
+    { passive: false },
+  );
+  window.addEventListener("touchend", stopDrag);
+
+  // Double Tap Seek Logic
+  let lastTap = 0;
+  playerContainer.addEventListener(
+    "touchstart",
+    (e) => {
+      const now = Date.now();
+      const tapDelay = now - lastTap;
+      lastTap = now;
+
+      if (tapDelay < 300) {
+        // Double Tap Detected
+        const rect = playerContainer.getBoundingClientRect();
+        const touchX = e.touches[0].clientX - rect.left;
+        const isRight = touchX > rect.width / 2;
+
+        const seekAmount = isRight ? 5 : -5;
+        video.currentTime = Math.max(
+          0,
+          Math.min(video.duration, video.currentTime + seekAmount),
+        );
+
+        // Visual Feedback
+        bigPlay.innerHTML = `<div style="display:flex; flex-direction:column; align-items:center; gap:5px">
+            <svg viewBox="0 0 24 24" width="30" height="30" fill="currentColor">
+              <path d="${isRight ? "M4 18l8.5-6L4 6v12zm9-12v12l8.5-6L13 6z" : "M20 18l-8.5-6L20 6v12zm-9-12v12l-8.5-6L11 6z"}"/>
+            </svg>
+            <div style="font-size:14px; font-weight:bold">${isRight ? "+5s" : "-5s"}</div>
+          </div>`;
+        bigPlay.classList.add("visible");
+        setTimeout(() => {
+          bigPlay.classList.remove("visible");
+          // Reset to play icon for next pause
+          setTimeout(() => {
+            bigPlay.innerHTML = `<svg viewBox="0 0 24 24" width="30" height="30" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>`;
+          }, 300);
+        }, 600);
+
+        e.preventDefault();
+      } else {
+        showControls();
+      }
+    },
+    { passive: false },
+  );
+
+  let hideTimeout;
+  const showControls = () => {
+    if (!playerContainer.classList.contains("touching")) {
+      lastShowTime = Date.now();
+    }
+    playerContainer.classList.add("touching");
+    clearTimeout(hideTimeout);
+    hideTimeout = setTimeout(
+      () => playerContainer.classList.remove("touching"),
+      2000,
+    );
+  };
+  playerContainer.onmousemove = showControls;
+
+  // Return cleanup function to remove window listeners when player is destroyed
+  playerContainer._cleanup = () => {
+    if (playerContainer.classList.contains("mori-fullscreen")) {
+      exitCustomFullscreen();
+    }
+    window.removeEventListener("keydown", handleKeydown);
+    window.removeEventListener("mousemove", doDrag);
+    window.removeEventListener("mouseup", stopDrag);
+    window.removeEventListener("touchmove", doDrag);
+    window.removeEventListener("touchend", stopDrag);
+    try {
+      userPaused = true;
+      video._isStopped = true;
+      video.autoplay = false;
+      video.pause();
+      video.removeAttribute("src");
+      video.load();
+    } catch (_) {}
+    if (playerContainer._blobUrl) {
+      URL.revokeObjectURL(playerContainer._blobUrl);
+    }
+  };
+
+  return playerContainer;
+}
